@@ -34,9 +34,26 @@ func isValidSchemaVersion(version string) bool {
 // Validate validates the instance, which must be a JSON value, against the schema.
 // It returns nil if validation is successful or an error if it is not.
 // If the schema type is "object", instance should be a map[string]any.
+// Use [Resolved.ValidateStructured] to obtain a typed *[ValidationError].
 func (rs *Resolved) Validate(instance any) error {
+	if ve := rs.ValidateStructured(instance); ve != nil {
+		return ve
+	}
+	return nil
+}
+
+// ValidateStructured validates the instance against the schema and returns a
+// structured *[ValidationError] on failure, or nil on success.
+// The returned error carries a [ValidationErrorKind] identifying which schema
+// keyword failed, a human-readable Message, a SchemaPath locating the failing
+// schema node, and a Causes slice for nested/aggregate failures.
+// If the schema type is "object", instance should be a map[string]any.
+func (rs *Resolved) ValidateStructured(instance any) *ValidationError {
 	if s := rs.root.Schema; !isValidSchemaVersion(s) {
-		return fmt.Errorf("cannot validate version %s, supported versions: draft-07 and draft 2020-12", s)
+		return &ValidationError{
+			Kind:    KindSchemaVersion,
+			Message: fmt.Sprintf("cannot validate version %s, supported versions: draft-07 and draft 2020-12", s),
+		}
 	}
 	st := &state{rs: rs}
 	return st.validate(reflect.ValueOf(instance), st.rs.root, nil)
@@ -63,8 +80,8 @@ func (rs *Resolved) validateDefaults() error {
 			if err := json.Unmarshal(s.Default, &d); err != nil {
 				return fmt.Errorf("unmarshaling default value of schema %s: %w", rs.schemaString(s), err)
 			}
-			if err := st.validate(reflect.ValueOf(d), s, nil); err != nil {
-				return err
+			if ve := st.validate(reflect.ValueOf(d), s, nil); ve != nil {
+				return ve
 			}
 		}
 	}
@@ -81,8 +98,19 @@ type state struct {
 }
 
 // validate validates the reflected value of the instance.
-func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *annotations) (err error) {
-	defer wrapf(&err, "validating %s", st.rs.schemaString(schema))
+func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *annotations) *ValidationError {
+	return st.validateWithPath(instance, schema, callerAnns, st.rs.schemaString(schema))
+}
+
+// validateWithPath is the real implementation of validate, threading the schemaPath
+// through so that every returned *ValidationError carries the path of the schema
+// node that failed.
+func (st *state) validateWithPath(instance reflect.Value, schema *Schema, callerAnns *annotations, schemaPath string) (retErr *ValidationError) {
+	defer func() {
+		if retErr != nil {
+			retErr = wrapValidationError(retErr, schemaPath)
+		}
+	}()
 
 	// Maintain a stack for dynamic schema resolution.
 	st.stack = append(st.stack, schema) // push
@@ -103,8 +131,12 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 	var anns annotations // all the annotations for this call and child calls
 	// $ref: https://json-schema.org/draft/2020-12/json-schema-core#section-8.2.3.1
 	if schema.Ref != "" {
-		if err := st.validate(instance, schemaInfo.resolvedRef, &anns); err != nil {
-			return err
+		if ve := st.validate(instance, schemaInfo.resolvedRef, &anns); ve != nil {
+			return &ValidationError{
+				Kind:    KindRef,
+				Message: fmt.Sprintf("$ref %q failed", schema.Ref),
+				Causes:  []*ValidationError{ve},
+			}
 		}
 		// https://json-schema.org/draft-07/draft-handrews-json-schema-01#rfc.section.8.3
 		// "All other properties in a "$ref" object MUST be ignored."
@@ -117,17 +149,17 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 	if schema.Type != "" || schema.Types != nil {
 		gotType, ok := jsonType(instance)
 		if !ok {
-			return fmt.Errorf("type: %v of type %[1]T is not a valid JSON value", instance)
+			return validationErrorf(KindInvalidType, "%v of type %[1]T is not a valid JSON value", instance)
 		}
 		if schema.Type != "" {
 			// "number" subsumes integers
 			if !(gotType == schema.Type ||
 				gotType == "integer" && schema.Type == "number") {
-				return fmt.Errorf("type: %v has type %q, want %q", instance, gotType, schema.Type)
+				return validationErrorf(KindType, "%v has type %q, want %q", instance, gotType, schema.Type)
 			}
 		} else {
 			if !(slices.Contains(schema.Types, gotType) || (gotType == "integer" && slices.Contains(schema.Types, "number"))) {
-				return fmt.Errorf("type: %v has type %q, want one of %q",
+				return validationErrorf(KindType, "%v has type %q, want one of %q",
 					instance, gotType, strings.Join(schema.Types, ", "))
 			}
 		}
@@ -142,14 +174,14 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			}
 		}
 		if !ok {
-			return fmt.Errorf("enum: %v does not equal any of: %v", instance, schema.Enum)
+			return validationErrorf(KindEnum, "%v does not equal any of: %v", instance, schema.Enum)
 		}
 	}
 
 	// const: https://json-schema.org/draft/2020-12/draft-bhutton-json-schema-validation-01#section-6.1.3
 	if schema.Const != nil {
 		if !equalValue(reflect.ValueOf(*schema.Const), instance) {
-			return fmt.Errorf("const: %v does not equal %v", instance, *schema.Const)
+			return validationErrorf(KindConst, "%v does not equal %v", instance, *schema.Const)
 		}
 	}
 
@@ -162,7 +194,7 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				// The test suite assumes floats.
 				nf, _ := n.Float64() // don't care if it's exact or not
 				if _, f := math.Modf(nf / *schema.MultipleOf); f != 0 {
-					return fmt.Errorf("multipleOf: %s is not a multiple of %f", n, *schema.MultipleOf)
+					return validationErrorf(KindMultipleOf, "%s is not a multiple of %f", n, *schema.MultipleOf)
 				}
 			}
 
@@ -170,16 +202,16 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			cmp := func(f float64) int { return n.Cmp(m.SetFloat64(f)) }
 
 			if schema.Minimum != nil && cmp(*schema.Minimum) < 0 {
-				return fmt.Errorf("minimum: %s is less than %f", n, *schema.Minimum)
+				return validationErrorf(KindMinimum, "%s is less than %f", n, *schema.Minimum)
 			}
 			if schema.Maximum != nil && cmp(*schema.Maximum) > 0 {
-				return fmt.Errorf("maximum: %s is greater than %f", n, *schema.Maximum)
+				return validationErrorf(KindMaximum, "%s is greater than %f", n, *schema.Maximum)
 			}
 			if schema.ExclusiveMinimum != nil && cmp(*schema.ExclusiveMinimum) <= 0 {
-				return fmt.Errorf("exclusiveMinimum: %s is less than or equal to %f", n, *schema.ExclusiveMinimum)
+				return validationErrorf(KindExclusiveMinimum, "%s is less than or equal to %f", n, *schema.ExclusiveMinimum)
 			}
 			if schema.ExclusiveMaximum != nil && cmp(*schema.ExclusiveMaximum) >= 0 {
-				return fmt.Errorf("exclusiveMaximum: %s is greater than or equal to %f", n, *schema.ExclusiveMaximum)
+				return validationErrorf(KindExclusiveMaximum, "%s is greater than or equal to %f", n, *schema.ExclusiveMaximum)
 			}
 		}
 	}
@@ -190,17 +222,17 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 		n := utf8.RuneCountInString(str)
 		if schema.MinLength != nil {
 			if m := *schema.MinLength; n < m {
-				return fmt.Errorf("minLength: %q contains %d Unicode code points, fewer than %d", str, n, m)
+				return validationErrorf(KindMinLength, "%q contains %d Unicode code points, fewer than %d", str, n, m)
 			}
 		}
 		if schema.MaxLength != nil {
 			if m := *schema.MaxLength; n > m {
-				return fmt.Errorf("maxLength: %q contains %d Unicode code points, more than %d", str, n, m)
+				return validationErrorf(KindMaxLength, "%q contains %d Unicode code points, more than %d", str, n, m)
 			}
 		}
 
 		if schema.Pattern != "" && !schemaInfo.pattern.MatchString(str) {
-			return fmt.Errorf("pattern: %q does not match regular expression %q", str, schema.Pattern)
+			return validationErrorf(KindPattern, "%q does not match regular expression %q", str, schema.Pattern)
 		}
 	}
 
@@ -211,8 +243,12 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			"DynamicRef not resolved properly")
 		if schemaInfo.resolvedDynamicRef != nil {
 			// Same as $ref.
-			if err := st.validate(instance, schemaInfo.resolvedDynamicRef, &anns); err != nil {
-				return err
+			if ve := st.validate(instance, schemaInfo.resolvedDynamicRef, &anns); ve != nil {
+				return &ValidationError{
+					Kind:    KindDynamicRef,
+					Message: fmt.Sprintf("$dynamicRef %q failed", schema.DynamicRef),
+					Causes:  []*ValidationError{ve},
+				}
 			}
 		} else {
 			// Dynamic behavior.
@@ -234,10 +270,14 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				}
 			}
 			if dynamicSchema == nil {
-				return fmt.Errorf("missing dynamic anchor %q", schemaInfo.dynamicRefAnchor)
+				return validationErrorf(KindDynamicRef, "missing dynamic anchor %q", schemaInfo.dynamicRefAnchor)
 			}
-			if err := st.validate(instance, dynamicSchema, &anns); err != nil {
-				return err
+			if ve := st.validate(instance, dynamicSchema, &anns); ve != nil {
+				return &ValidationError{
+					Kind:    KindDynamicRef,
+					Message: fmt.Sprintf("$dynamicRef %q failed", schema.DynamicRef),
+					Causes:  []*ValidationError{ve},
+				}
 			}
 		}
 	}
@@ -255,22 +295,29 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 
 	if schema.AllOf != nil {
 		for _, ss := range schema.AllOf {
-			if err := st.validate(instance, ss, &anns); err != nil {
-				return err
+			if ve := st.validate(instance, ss, &anns); ve != nil {
+				return &ValidationError{
+					Kind:    KindAllOf,
+					Message: "allOf: a subschema did not validate",
+					Causes:  []*ValidationError{ve},
+				}
 			}
 		}
 	}
 	if schema.AnyOf != nil {
 		// We must visit them all, to collect annotations.
-		var errs []error
+		var causes []*ValidationError
 		for _, ss := range schema.AnyOf {
-			if err := st.validate(instance, ss, &anns); err != nil {
-				errs = append(errs, err)
+			if ve := st.validate(instance, ss, &anns); ve != nil {
+				causes = append(causes, ve)
 			}
 		}
-		if len(errs) == len(schema.AnyOf) {
-			return fmt.Errorf("anyOf: did not validate against any of %v:\n%v",
-				schema.AnyOf, errors.Join(errs...))
+		if len(causes) == len(schema.AnyOf) {
+			return &ValidationError{
+				Kind:    KindAnyOf,
+				Message: fmt.Sprintf("anyOf: did not validate against any of %d subschemas", len(schema.AnyOf)),
+				Causes:  causes,
+			}
 		}
 	}
 	if schema.OneOf != nil {
@@ -279,19 +326,19 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 		for _, ss := range schema.OneOf {
 			if valid(ss, &anns) {
 				if okSchema != nil {
-					return fmt.Errorf("oneOf: validated against both %v and %v", okSchema, ss)
+					return validationErrorf(KindOneOf, "validated against both %v and %v", okSchema, ss)
 				}
 				okSchema = ss
 			}
 		}
 		if okSchema == nil {
-			return fmt.Errorf("oneOf: did not validate against any of %v", schema.OneOf)
+			return validationErrorf(KindOneOf, "did not validate against any of %d subschemas", len(schema.OneOf))
 		}
 	}
 	if schema.Not != nil {
 		// Ignore annotations from "not".
 		if valid(schema.Not, nil) {
-			return fmt.Errorf("not: validated against %v", schema.Not)
+			return validationErrorf(KindNot, "validated against %v", schema.Not)
 		}
 	}
 	if schema.If != nil {
@@ -302,8 +349,12 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			ss = schema.Else
 		}
 		if ss != nil {
-			if err := st.validate(instance, ss, &anns); err != nil {
-				return err
+			if ve := st.validate(instance, ss, &anns); ve != nil {
+				return &ValidationError{
+					Kind:    KindIf,
+					Message: "if/then/else: branch did not validate",
+					Causes:  []*ValidationError{ve},
+				}
 			}
 		}
 	}
@@ -323,23 +374,23 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 					if i >= instance.Len() {
 						break // shorter is OK
 					}
-					if err := st.validate(instance.Index(i), ischema, nil); err != nil {
-						return err
+					if ve := st.validate(instance.Index(i), ischema, nil); ve != nil {
+						return ve
 					}
 				}
 				anns.noteEndIndex(min(len(schema.ItemsArray), instance.Len()))
 				if schema.AdditionalItems != nil {
 					for i := len(schema.ItemsArray); i < instance.Len(); i++ {
-						if err := st.validate(instance.Index(i), schema.AdditionalItems, nil); err != nil {
-							return err
+						if ve := st.validate(instance.Index(i), schema.AdditionalItems, nil); ve != nil {
+							return ve
 						}
 					}
 					anns.allItems = true
 				}
 			} else if schema.Items != nil {
 				for i := 0; i < instance.Len(); i++ {
-					if err := st.validate(instance.Index(i), schema.Items, nil); err != nil {
-						return err
+					if ve := st.validate(instance.Index(i), schema.Items, nil); ve != nil {
+						return ve
 					}
 				}
 				// Note that all the items in this array have been validated.
@@ -351,15 +402,15 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				if i >= instance.Len() {
 					break // shorter is OK
 				}
-				if err := st.validate(instance.Index(i), ischema, nil); err != nil {
-					return err
+				if ve := st.validate(instance.Index(i), ischema, nil); ve != nil {
+					return ve
 				}
 			}
 			anns.noteEndIndex(min(len(schema.PrefixItems), instance.Len()))
 			if schema.Items != nil {
 				for i := len(schema.PrefixItems); i < instance.Len(); i++ {
-					if err := st.validate(instance.Index(i), schema.Items, nil); err != nil {
-						return err
+					if ve := st.validate(instance.Index(i), schema.Items, nil); ve != nil {
+						return ve
 					}
 				}
 				// Note that all the items in this array have been validated.
@@ -375,7 +426,7 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				}
 			}
 			if nContains == 0 && (schema.MinContains == nil || *schema.MinContains > 0) {
-				return fmt.Errorf("contains: %s does not have an item matching %s", instance, schema.Contains)
+				return validationErrorf(KindContains, "%s does not have an item matching %s", instance, schema.Contains)
 			}
 		}
 
@@ -383,22 +434,22 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 		// TODO(jba): check that these next four keywords' values are integers.
 		if schema.MinContains != nil && schema.Contains != nil {
 			if m := *schema.MinContains; nContains < m {
-				return fmt.Errorf("minContains: contains validated %d items, less than %d", nContains, m)
+				return validationErrorf(KindMinContains, "contains validated %d items, less than %d", nContains, m)
 			}
 		}
 		if schema.MaxContains != nil && schema.Contains != nil {
 			if m := *schema.MaxContains; nContains > m {
-				return fmt.Errorf("maxContains: contains validated %d items, greater than %d", nContains, m)
+				return validationErrorf(KindMaxContains, "contains validated %d items, greater than %d", nContains, m)
 			}
 		}
 		if schema.MinItems != nil {
 			if m := *schema.MinItems; instance.Len() < m {
-				return fmt.Errorf("minItems: array length %d is less than %d", instance.Len(), m)
+				return validationErrorf(KindMinItems, "array length %d is less than %d", instance.Len(), m)
 			}
 		}
 		if schema.MaxItems != nil {
 			if m := *schema.MaxItems; instance.Len() > m {
-				return fmt.Errorf("maxItems: array length %d is greater than %d", instance.Len(), m)
+				return validationErrorf(KindMaxItems, "array length %d is greater than %d", instance.Len(), m)
 			}
 		}
 		if schema.UniqueItems {
@@ -419,7 +470,7 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 					if sames := hashes[hv]; len(sames) > 0 {
 						for _, j := range sames {
 							if equalValue(item, instance.Index(j)) {
-								return fmt.Errorf("uniqueItems: array items %d and %d are equal", i, j)
+								return validationErrorf(KindUniqueItems, "array items %d and %d are equal", i, j)
 							}
 						}
 					}
@@ -434,8 +485,12 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			// That includes validations by subschemas on the same instance, like allOf.
 			for i := anns.endIndex; i < instance.Len(); i++ {
 				if !anns.evaluatedIndexes[i] {
-					if err := st.validate(instance.Index(i), schema.UnevaluatedItems, nil); err != nil {
-						return err
+					if ve := st.validate(instance.Index(i), schema.UnevaluatedItems, nil); ve != nil {
+						return &ValidationError{
+							Kind:    KindUnevaluatedItems,
+							Message: fmt.Sprintf("unevaluatedItems: item %d did not validate", i),
+							Causes:  []*ValidationError{ve},
+						}
 					}
 				}
 			}
@@ -447,11 +502,14 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 	// https://json-schema.org/draft/2020-12/json-schema-core#section-10.3.2
 	// Validating structs is problematic. See https://github.com/google/jsonschema-go/issues/23.
 	if instance.Kind() == reflect.Struct {
-		return errors.New("cannot validate against a struct; see https://github.com/google/jsonschema-go/issues/23 for details")
+		return &ValidationError{
+			Kind:    KindStructInstance,
+			Message: "cannot validate against a struct; see https://github.com/google/jsonschema-go/issues/23 for details",
+		}
 	}
 	if instance.Kind() == reflect.Map {
 		if kt := instance.Type().Key(); kt.Kind() != reflect.String {
-			return fmt.Errorf("map key type %s is not a string", kt)
+			return validationErrorf(KindMapKeyType, "map key type %s is not a string", kt)
 		}
 		// Track the evaluated properties for just this schema, to support additionalProperties.
 		// If we used anns here, then we'd be including properties evaluated in subschemas
@@ -469,8 +527,8 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			if instance.Kind() == reflect.Struct && val.IsZero() && !schemaInfo.isRequired[prop] {
 				continue
 			}
-			if err := st.validate(val, subschema, nil); err != nil {
-				return err
+			if ve := st.validate(val, subschema, nil); ve != nil {
+				return ve
 			}
 			evalProps[prop] = true
 		}
@@ -479,8 +537,8 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				// Check every matching pattern.
 				for re, schema := range schemaInfo.patternProperties {
 					if re.MatchString(prop) {
-						if err := st.validate(val, schema, nil); err != nil {
-							return err
+						if ve := st.validate(val, schema, nil); ve != nil {
+							return ve
 						}
 						evalProps[prop] = true
 					}
@@ -506,14 +564,14 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 					}
 				}
 				if len(disallowed) > 0 {
-					return fmt.Errorf("unexpected additional properties %q", disallowed)
+					return validationErrorf(KindAdditionalProperties, "unexpected additional properties %q", disallowed)
 				}
 			} else {
 				// Apply to all properties not handled above.
 				for prop, val := range properties(instance) {
 					if !evalProps[prop] {
-						if err := st.validate(val, schema.AdditionalProperties, nil); err != nil {
-							return err
+						if ve := st.validate(val, schema.AdditionalProperties, nil); ve != nil {
+							return ve
 						}
 						evalProps[prop] = true
 					}
@@ -525,8 +583,8 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			// Note: properties unnecessarily fetches each value. We could define a propertyNames function
 			// if performance ever matters.
 			for prop := range properties(instance) {
-				if err := st.validate(reflect.ValueOf(prop), schema.PropertyNames, nil); err != nil {
-					return err
+				if ve := st.validate(reflect.ValueOf(prop), schema.PropertyNames, nil); ve != nil {
+					return ve
 				}
 			}
 		}
@@ -538,12 +596,12 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 		}
 		if schema.MinProperties != nil {
 			if n, m := max, *schema.MinProperties; n < m {
-				return fmt.Errorf("minProperties: object has %d properties, less than %d", n, m)
+				return validationErrorf(KindMinProperties, "object has %d properties, less than %d", n, m)
 			}
 		}
 		if schema.MaxProperties != nil {
 			if n, m := min, *schema.MaxProperties; n > m {
-				return fmt.Errorf("maxProperties: object has %d properties, greater than %d", n, m)
+				return validationErrorf(KindMaxProperties, "object has %d properties, greater than %d", n, m)
 			}
 		}
 
@@ -563,7 +621,7 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 
 		if schema.Required != nil {
 			if m := missingProperties(schema.Required); len(m) > 0 {
-				return fmt.Errorf("required: missing properties: %q", m)
+				return validationErrorf(KindRequired, "missing properties: %q", m)
 			}
 		}
 
@@ -572,7 +630,7 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				for dprop, dstrings := range schema.DependencyStrings {
 					if hasProperty(dprop) {
 						if m := missingProperties(dstrings); len(m) > 0 {
-							return fmt.Errorf("dependentRequired[%q]: missing properties %q", dprop, m)
+							return validationErrorf(KindDependentRequired, "dependentRequired[%q]: missing properties %q", dprop, m)
 						}
 					}
 				}
@@ -580,9 +638,8 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			if schema.DependencySchemas != nil {
 				for dprop, dschema := range schema.DependencySchemas {
 					if hasProperty(dprop) {
-						err := st.validate(instance, dschema, &anns)
-						if err != nil {
-							return err
+						if ve := st.validate(instance, dschema, &anns); ve != nil {
+							return ve
 						}
 					}
 				}
@@ -595,7 +652,7 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				for dprop, reqs := range schema.DependentRequired {
 					if hasProperty(dprop) {
 						if m := missingProperties(reqs); len(m) > 0 {
-							return fmt.Errorf("dependentRequired[%q]: missing properties %q", dprop, m)
+							return validationErrorf(KindDependentRequired, "dependentRequired[%q]: missing properties %q", dprop, m)
 						}
 					}
 				}
@@ -607,9 +664,8 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 				for dprop, ss := range schema.DependentSchemas {
 					if hasProperty(dprop) {
 						// TODO: include dependentSchemas[dprop] in the errors.
-						err := st.validate(instance, ss, &anns)
-						if err != nil {
-							return err
+						if ve := st.validate(instance, ss, &anns); ve != nil {
+							return ve
 						}
 					}
 				}
@@ -621,8 +677,12 @@ func (st *state) validate(instance reflect.Value, schema *Schema, callerAnns *an
 			// in addition to sibling keywords.
 			for prop, val := range properties(instance) {
 				if !anns.evaluatedProperties[prop] {
-					if err := st.validate(val, schema.UnevaluatedProperties, nil); err != nil {
-						return err
+					if ve := st.validate(val, schema.UnevaluatedProperties, nil); ve != nil {
+						return &ValidationError{
+							Kind:    KindUnevaluatedProperties,
+							Message: fmt.Sprintf("unevaluatedProperties: property %q did not validate", prop),
+							Causes:  []*ValidationError{ve},
+						}
 					}
 				}
 			}

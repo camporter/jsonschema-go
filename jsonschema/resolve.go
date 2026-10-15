@@ -107,12 +107,21 @@ type resolvedInfo struct {
 // It must not be modified.
 func (r *Resolved) Schema() *Schema { return r.root }
 
-// schemaString returns a short string describing the schema.
+// schemaString returns a short string describing the schema suitable for use
+// as a SchemaPath in a [ValidationError].  The root schema returns "" (no
+// path component); sub-schemas return their JSON-Pointer path from the root
+// (e.g. "/properties/age").  Anonymous schemas (not reachable via a known
+// field) return "<anonymous schema>".
 func (r *Resolved) schemaString(s *Schema) string {
 	if s.ID != "" {
 		return s.ID
 	}
 	info := r.resolvedInfos[s]
+	// "root" is the sentinel assigned by checkStructure for the root schema.
+	// It is not a valid JSON Pointer, so treat it as empty (no path).
+	if info.path == "root" {
+		return ""
+	}
 	if info.path != "" {
 		return info.path
 	}
